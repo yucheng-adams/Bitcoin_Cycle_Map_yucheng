@@ -31,8 +31,11 @@ nextHalving = input.time(timestamp("08 Apr 2028 00:00 +0000"), "下一次减半�
 
 rangeStart = input.time(timestamp("06 Oct 2025 00:00 +0000"), "最低价统计起点", group = "03 区间最低价")
 latestEqualLow = input.bool(false, "相同最低价标记最后一次", group = "03 区间最低价")
-rangeLowTitle = input.string("Bottom since", "最低价标签文字", group = "03 区间最低价")
+rangeLowTitle = input.string("Low", "最低价标签文字", group = "03 区间最低价")
 
+// 精简模式：预测仅显示B/T，窗口边界仅画线，详细信息放入悬停提示。
+compactMarkers = input.bool(true, "精简预测与最低价标签", group = "04 标签与外观")
+lowLabelOffset = input.float(0.8, "精简Low文字下移%", minval = 0.0, maxval = 20.0, step = 0.1, group = "04 标签与外观")
 // 文字、颜色、方向互相独立：改颜色不会改变标签方向。
 topTitle = input.string("历史周期高点", "历史高点文字", group = "04 标签与外观")
 bottomTitle = input.string("历史周期低点", "历史低点文字", group = "04 标签与外观")
@@ -148,7 +151,7 @@ bool historyIncomplete = firstLoadedTime > rangeStart
 // ============================================================================
 var array<line> linePool = array.new<line>()
 var array<label> labelPool = array.new<label>()
-f_mark(int slot, int t, float y, string title, color c, bool below, string stroke, bool withLine) =>
+f_mark(int slot, int t, float y, string title, color c, bool below, string stroke, bool withLine, bool compact = false, string hint = "", bool muted = false) =>
     if slot >= array.size(labelPool)
         array.push(labelPool, label.new(na, na, "", xloc = xloc.bar_time, yloc = yloc.price))
         array.push(linePool, line.new(na, na, na, na, xloc = xloc.bar_time, extend = extend.both))
@@ -156,18 +159,25 @@ f_mark(int slot, int t, float y, string title, color c, bool below, string strok
     line ln = array.get(linePool, slot)
     label.set_xy(lb, t, y)
     label.set_text(lb, title)
-    label.set_style(lb, below ? label.style_label_up : label.style_label_down)
-    label.set_color(lb, color.new(c, 15))
-    label.set_textcolor(lb, textColor)
-    label.set_size(lb, labelSize)
+    label.set_style(lb, compact ? label.style_none : below ? label.style_label_up : label.style_label_down)
+    label.set_color(lb, compact ? color.new(c, 100) : color.new(c, 15))
+    label.set_textcolor(lb, compact ? c : textColor)
+    label.set_size(lb, compact ? size.tiny : labelSize)
+    label.set_tooltip(lb, hint == "" ? title : hint)
     line.set_xy1(ln, t, y)
     line.set_xy2(ln, t, y * 1.01)
     line.set_style(ln, stroke)
     line.set_width(ln, lineWidth)
-    line.set_color(ln, withLine and showLines ? color.new(c, lineTransparency) : na)
+    line.set_color(ln, withLine and showLines ? color.new(c, muted ? math.max(lineTransparency, 80) : lineTransparency) : na)
     slot + 1
 
-var table panel = table.new(panelPosition, 2, 9, border_width = 1)
+// 精简模式下边界不写文字，只留淡线；参考点显示B/T，完整日期可悬停查看。
+f_forecast(int slot, int t, float y, string shortText, string detail, color c, bool below, bool boundary) =>
+    string fullText = detail + "\n" + f_date(t)
+    string visibleText = compactMarkers ? (boundary ? "" : shortText) : fullText
+    f_mark(slot, t, y, visibleText, c, below, line.style_dashed, true, compactMarkers, fullText, compactMarkers and boundary)
+
+var table panel = table.new(panelPosition, 2, 11, border_width = 1)
 f_row(int row, string key, string value) =>
     table.cell(panel, 0, row, key, text_color = chart.fg_color, bgcolor = color.new(chart.bg_color, 10))
     table.cell(panel, 1, row, value, text_color = chart.fg_color, bgcolor = color.new(chart.bg_color, 10))
@@ -197,25 +207,27 @@ if barstate.islast
     float gap = forecastGap / 100.0
     if showForecast
         if showBoundaries
-            slot := f_mark(slot, lowEarly, base * (1 + gap), "低点最短时长类比\n" + f_date(lowEarly), bottomColor, bottomBelow, line.style_dashed, true)
-            slot := f_mark(slot, lowLate, base * (1 + gap * 3), "低点最长时长类比\n" + f_date(lowLate), bottomColor, bottomBelow, line.style_dashed, true)
-            slot := f_mark(slot, topEarly, base * (1 + gap), "高点较早情景\n" + f_date(topEarly), topColor, topBelow, line.style_dashed, true)
-            slot := f_mark(slot, topLate, base * (1 + gap * 3), "高点较晚情景\n" + f_date(topLate), topColor, topBelow, line.style_dashed, true)
-        slot := f_mark(slot, lowMid, base * (1 + gap * 2), "低点参考（时间假设）\n" + f_date(lowMid), bottomColor, bottomBelow, line.style_dashed, true)
-        slot := f_mark(slot, topMid, base * (1 + gap * 2), "高点参考（时间假设）\n" + f_date(topMid), topColor, topBelow, line.style_dashed, true)
+            slot := f_forecast(slot, lowEarly, base * (1 + gap), "", "低点最短时长类比", bottomColor, bottomBelow, true)
+            slot := f_forecast(slot, lowLate, base * (1 + gap * 3), "", "低点最长时长类比", bottomColor, bottomBelow, true)
+            slot := f_forecast(slot, topEarly, base * (1 + gap), "", "高点较早情景", topColor, topBelow, true)
+            slot := f_forecast(slot, topLate, base * (1 + gap * 3), "", "高点较晚情景", topColor, topBelow, true)
+        slot := f_forecast(slot, lowMid, base * (1 + gap * 2), "B", "低点参考（时间假设，非价格预测）", bottomColor, bottomBelow, false)
+        slot := f_forecast(slot, topMid, base * (1 + gap * 2), "T", "高点参考（时间假设，非价格预测）", topColor, topBelow, false)
     if showNextHalving
-        slot := f_mark(slot, nextHalving, base * (1 + gap * 4), "第五次减半（手动估计）\n" + f_date(nextHalving), halvingColor, false, line.style_dashed, true)
+        slot := f_forecast(slot, nextHalving, base * (1 + gap * 4), "H", "第五次减半（手动估计）", halvingColor, false, false)
     if showRangeLow and not na(rangeLowPrice)
         string lowText = rangeLowTitle + " " + f_date(rangeStart) + "\n价格：" + str.tostring(rangeLowPrice, format.mintick) + "\nK线日期：" + f_date(rangeLowTime)
         if historyIncomplete
             lowText += "\n注意：加载历史未覆盖起点"
-        slot := f_mark(slot, rangeLowTime, rangeLowPrice, lowText, bottomColor, bottomBelow, historyStyle, false)
+        // 下移的只是文字，统计值和表格仍使用真实最低价；完整信息保留在悬停提示中。
+        float lowY = compactMarkers ? rangeLowPrice * (1 - lowLabelOffset / 100.0) : rangeLowPrice
+        slot := f_mark(slot, rangeLowTime, lowY, compactMarkers ? rangeLowTitle : lowText, bottomColor, bottomBelow, historyStyle, false, compactMarkers, lowText)
 
     // 回放或记录数量变化后，删除本轮多余的对象。
     while array.size(labelPool) > slot
         label.delete(array.pop(labelPool))
         line.delete(array.pop(linePool))
-    table.clear(panel, 0, 0, 1, 8)
+    table.clear(panel, 0, 0, 1, 10)
     if showPanel
         f_row(0, "BTC 周期地图", "UTC · 时间类比，非交易信号")
         if showForecast
@@ -225,6 +237,8 @@ if barstate.islast
             f_row(3, "假设下跌阶段", f_span(anchor, lowMid))
             f_row(4, useManualBottom ? "独立锚点上涨阶段" : "假设上涨阶段", f_span(riseMid, topMid))
             f_row(5, "下一高点类比窗口", f_span(topEarly, topLate))
+            f_row(9, "B · 低点参考", f_date(lowMid))
+            f_row(10, "T · 高点参考", f_date(topMid))
         if showNextHalving
             f_row(6, "减半手动估计", f_date(nextHalving))
         if showRangeLow
