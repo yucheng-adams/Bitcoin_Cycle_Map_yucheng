@@ -1,0 +1,249 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © GhostLayer
+//@version=6
+indicator("BTC 周期地图 · 自定义版", overlay = true, max_lines_count = 200, max_labels_count = 200)
+
+// ============================================================================
+// A. 设置区：日常调整优先使用指标设置，不必修改下面的绘图代码。
+// 所有日期均按 UTC 显示；默认适合 BTC/USD、BTC/USDT 的标准日线。
+// ============================================================================
+showHistory = input.bool(true, "历史周期高低点", group = "01 显示")
+showHalvings = input.bool(true, "历史减半", group = "01 显示")
+showForecast = input.bool(true, "时间推算", group = "01 显示")
+showNextHalving = input.bool(true, "下一次减半估计", group = "01 显示")
+showRangeLow = input.bool(true, "区间最低价", group = "01 显示")
+showPanel = input.bool(true, "信息表格", group = "01 显示")
+showShade = input.bool(true, "假设阶段背景色", group = "01 显示")
+showLines = input.bool(true, "事件竖线", group = "01 显示")
+showBoundaries = input.bool(true, "推算窗口两端（关闭后仅显示参考日）", group = "01 显示")
+
+// 日期推算完全独立于市场价格，不会自动确认趋势或顶底。
+anchor = input.time(timestamp("06 Oct 2025 00:00 +0000"), "假设顶部日期", group = "02 时间模型")
+bearMin = input.int(363, "下跌最短天数", minval = 1, group = "02 时间模型")
+bearMid = input.int(383, "下跌参考天数", minval = 1, group = "02 时间模型")
+bearMax = input.int(410, "下跌最长天数", minval = 1, group = "02 时间模型")
+bullMin = input.int(1061, "上涨最短天数", minval = 1, group = "02 时间模型")
+bullMid = input.int(1065, "上涨参考天数", minval = 1, group = "02 时间模型")
+bullMax = input.int(1068, "上涨最长天数", minval = 1, group = "02 时间模型")
+useManualBottom = input.bool(false, "使用独立低点锚点推算下一高点", group = "02 时间模型", tooltip = "开启：下一高点从你输入的低点日期计算。关闭：从预测低点计算，误差会继续传递。")
+manualBottom = input.time(timestamp("24 Oct 2026 00:00 +0000"), "独立低点锚点", group = "02 时间模型")
+nextHalving = input.time(timestamp("08 Apr 2028 00:00 +0000"), "下一次减半估计日期", group = "02 时间模型", tooltip = "手动估计，不联网更新；实际由区块1,050,000触发。")
+
+rangeStart = input.time(timestamp("06 Oct 2025 00:00 +0000"), "最低价统计起点", group = "03 区间最低价")
+latestEqualLow = input.bool(false, "相同最低价标记最后一次", group = "03 区间最低价")
+rangeLowTitle = input.string("Bottom since", "最低价标签文字", group = "03 区间最低价")
+
+// 文字、颜色、方向互相独立：改颜色不会改变标签方向。
+topTitle = input.string("历史周期高点", "历史高点文字", group = "04 标签与外观")
+bottomTitle = input.string("历史周期低点", "历史低点文字", group = "04 标签与外观")
+topBelow = input.bool(false, "高点文字放在标注位置下方", group = "04 标签与外观")
+bottomBelow = input.bool(true, "低点文字放在标注位置下方", group = "04 标签与外观")
+topColor = input.color(color.red, "高点颜色", group = "04 标签与外观")
+bottomColor = input.color(color.teal, "低点颜色", group = "04 标签与外观")
+halvingColor = input.color(color.orange, "减半颜色", group = "04 标签与外观")
+textColor = input.color(color.white, "标签文字颜色", group = "04 标签与外观")
+fontChoice = input.string("小", "标签字号", options = ["小", "中", "大"], group = "04 标签与外观")
+lineChoice = input.string("点线", "历史事件线型", options = ["实线", "虚线", "点线"], group = "04 标签与外观")
+lineWidth = input.int(1, "线宽", minval = 1, maxval = 4, group = "04 标签与外观")
+lineTransparency = input.int(40, "线条透明度", minval = 0, maxval = 100, group = "04 标签与外观")
+shadeTransparency = input.int(93, "背景透明度", minval = 0, maxval = 100, group = "04 标签与外观")
+forecastBase = input.float(0.0, "预测标签基准价格（0=最新收盘价）", minval = 0.0, group = "04 标签与外观")
+forecastGap = input.float(12.0, "预测标签分层间距%", minval = 1.0, maxval = 100.0, group = "04 标签与外观")
+halvingMultiplier = input.float(1.5, "减半文字高度倍数", minval = 0.1, group = "04 标签与外观")
+panelCorner = input.string("右上", "表格位置", options = ["右上", "右下", "左上", "左下"], group = "04 标签与外观")
+
+// ============================================================================
+// B. 通用函数及事件结构：通常不用修改。
+// 每条历史记录自带日期、位置、类型、标题，不再依赖奇偶顺序或数组配对。
+// kind：top=高点，bottom=低点，halving=减半。
+// customTitle 留空时使用设置区的统一名称，否则使用该事件的专属文字。
+// ============================================================================
+int DAY = 86400000
+f_ts(int y, int m, int d) => timestamp("UTC", y, m, d, 0, 0)
+f_date(int t) => str.format_time(t, "yyyy-MM-dd", "UTC")
+f_span(int a, int b) => f_date(a) + " ~ " + f_date(b)
+string labelSize = fontChoice == "小" ? size.small : fontChoice == "中" ? size.normal : size.large
+string historyStyle = lineChoice == "实线" ? line.style_solid : lineChoice == "虚线" ? line.style_dashed : line.style_dotted
+string panelPosition = switch panelCorner
+    "右下" => position.bottom_right
+    "左上" => position.top_left
+    "左下" => position.bottom_left
+    => position.top_right
+
+type CycleEvent
+    int date
+    float price
+    string kind
+    string customTitle
+
+var array<CycleEvent> events = array.new<CycleEvent>()
+
+// ============================================================================
+// C. 历史数据编辑区：添加或修改事件只需操作一行。
+// 示例：array.push(events, CycleEvent.new(f_ts(2030, 1, 1), 50000.0, "bottom", "自定义低点"))
+// price 仅是标签的纵坐标，属于近似历史价格，不参与任何周期推算。
+// 历史日期是人工事后整理，不是脚本在当时就能识别的信号。
+// ============================================================================
+if barstate.isfirst
+    array.push(events, CycleEvent.new(f_ts(2011, 6, 8), 31.9, "top", ""))
+    array.push(events, CycleEvent.new(f_ts(2011, 11, 18), 2.0, "bottom", ""))
+    array.push(events, CycleEvent.new(f_ts(2013, 11, 30), 1163.0, "top", ""))
+    array.push(events, CycleEvent.new(f_ts(2015, 1, 14), 152.0, "bottom", ""))
+    array.push(events, CycleEvent.new(f_ts(2017, 12, 17), 19800.0, "top", ""))
+    array.push(events, CycleEvent.new(f_ts(2018, 12, 15), 3122.0, "bottom", ""))
+    array.push(events, CycleEvent.new(f_ts(2021, 11, 10), 69000.0, "top", ""))
+    array.push(events, CycleEvent.new(f_ts(2022, 11, 21), 15500.0, "bottom", ""))
+    array.push(events, CycleEvent.new(f_ts(2025, 10, 6), 126210.5, "top", "候选周期顶部（手动记录）"))
+    array.push(events, CycleEvent.new(f_ts(2012, 11, 28), 12.0, "halving", "第一次减半"))
+    array.push(events, CycleEvent.new(f_ts(2016, 7, 9), 650.0, "halving", "第二次减半"))
+    array.push(events, CycleEvent.new(f_ts(2020, 5, 11), 8600.0, "halving", "第三次减半"))
+    array.push(events, CycleEvent.new(f_ts(2024, 4, 20), 64000.0, "halving", "第四次减半"))
+    if array.size(events) > 180
+        runtime.error("历史事件请限制在180条以内，为推算标记预留空间。")
+    for ev in events
+        if ev.price <= 0 or (ev.kind != "top" and ev.kind != "bottom" and ev.kind != "halving")
+            runtime.error("历史事件价格须大于0，类型须为top、bottom或halving。")
+
+// ============================================================================
+// D. 时间模型：仅使用手动天数。修改历史事件不会自动重算这些默认参数。
+// 下跌样本410/363/376天，平均383天；上涨样本1068/1061天，参考取整1065天。
+// 窗口是历史最短/最长类比，不是概率区间，也不是确认的顶部或底部。
+// ============================================================================
+bool validDurations = bearMin <= bearMid and bearMid <= bearMax and bullMin <= bullMid and bullMid <= bullMax
+if barstate.isfirst and not validDurations
+    runtime.error("上涨和下跌天数都必须满足：最短 ≤ 参考 ≤ 最长。")
+int lowEarly = anchor + bearMin * DAY
+int lowMid = anchor + bearMid * DAY
+int lowLate = anchor + bearMax * DAY
+int riseEarly = useManualBottom ? manualBottom : lowEarly
+int riseMid = useManualBottom ? manualBottom : lowMid
+int riseLate = useManualBottom ? manualBottom : lowLate
+int topEarly = riseEarly + bullMin * DAY
+int topMid = riseMid + bullMid * DAY
+int topLate = riseLate + bullMax * DAY
+if barstate.isfirst and useManualBottom and manualBottom <= anchor
+    runtime.error("独立低点锚点必须晚于假设顶部日期。")
+
+// ============================================================================
+// E. 区间最低价：逐根比较当前图表真实low；不使用历史事件的近似价格。
+// 仅统计开盘时间>=起点的K线。周线跨越起点时会排除整根跨界K线。
+// 使用标准日线、UTC零点起点更合适；日内图可能历史不足，合成K线并非真实报价。
+// ============================================================================
+var int firstLoadedTime = time
+var float rangeLowPrice = na
+var int rangeLowTime = na
+if time >= rangeStart
+    bool replaceLow = na(rangeLowPrice)
+    if not replaceLow
+        replaceLow := latestEqualLow ? low <= rangeLowPrice : low < rangeLowPrice
+    if replaceLow
+        rangeLowPrice := low
+        rangeLowTime := time
+bool historyIncomplete = firstLoadedTime > rangeStart
+
+// ============================================================================
+// F. 绘图工具：复用已有对象，更新坐标/文字，避免每次报价都删除重建全部对象。
+// slot 是本轮绘图的位置编号，函数返回下一个编号。
+// below 决定方向，独立于颜色；withLine 可以单独关闭该事件的竖线。
+// ============================================================================
+var array<line> linePool = array.new<line>()
+var array<label> labelPool = array.new<label>()
+f_mark(int slot, int t, float y, string title, color c, bool below, string stroke, bool withLine) =>
+    if slot >= array.size(labelPool)
+        array.push(labelPool, label.new(na, na, "", xloc = xloc.bar_time, yloc = yloc.price))
+        array.push(linePool, line.new(na, na, na, na, xloc = xloc.bar_time, extend = extend.both))
+    label lb = array.get(labelPool, slot)
+    line ln = array.get(linePool, slot)
+    label.set_xy(lb, t, y)
+    label.set_text(lb, title)
+    label.set_style(lb, below ? label.style_label_up : label.style_label_down)
+    label.set_color(lb, color.new(c, 15))
+    label.set_textcolor(lb, textColor)
+    label.set_size(lb, labelSize)
+    line.set_xy1(ln, t, y)
+    line.set_xy2(ln, t, y * 1.01)
+    line.set_style(ln, stroke)
+    line.set_width(ln, lineWidth)
+    line.set_color(ln, withLine and showLines ? color.new(c, lineTransparency) : na)
+    slot + 1
+
+var table panel = table.new(panelPosition, 2, 9, border_width = 1)
+f_row(int row, string key, string value) =>
+    table.cell(panel, 0, row, key, text_color = chart.fg_color, bgcolor = color.new(chart.bg_color, 10))
+    table.cell(panel, 1, row, value, text_color = chart.fg_color, bgcolor = color.new(chart.bg_color, 10))
+
+// ============================================================================
+// G. 统一绘制：历史、预测、最低价可以独立开关。
+// 回放时用最后一根可见数据K线的结束时间过滤历史记录，避免直接显示未来记录。
+// 但人工顶底本身仍带有事后信息，不能作为无前视偏差的回测信号。
+// ============================================================================
+if barstate.islast
+    int slot = 0
+    int cutoff = na(time_close) ? time : time_close
+    for ev in events
+        bool isHalving = ev.kind == "halving"
+        bool isBottom = ev.kind == "bottom"
+        bool enabled = isHalving ? showHalvings : showHistory
+        if enabled and ev.date < cutoff
+            string fallback = isBottom ? bottomTitle : topTitle
+            string title = ev.customTitle == "" ? fallback : ev.customTitle
+            color c = isHalving ? halvingColor : isBottom ? bottomColor : topColor
+            bool below = isHalving ? false : isBottom ? bottomBelow : topBelow
+            float y = isHalving ? ev.price * halvingMultiplier : ev.price
+            slot := f_mark(slot, ev.date, y, title + "\n" + f_date(ev.date), c, below, historyStyle, true)
+
+    // 预测标记纵坐标仅用于文字排版，不是未来目标价。
+    float base = forecastBase > 0 ? forecastBase : close
+    float gap = forecastGap / 100.0
+    if showForecast
+        if showBoundaries
+            slot := f_mark(slot, lowEarly, base * (1 + gap), "低点最短时长类比\n" + f_date(lowEarly), bottomColor, bottomBelow, line.style_dashed, true)
+            slot := f_mark(slot, lowLate, base * (1 + gap * 3), "低点最长时长类比\n" + f_date(lowLate), bottomColor, bottomBelow, line.style_dashed, true)
+            slot := f_mark(slot, topEarly, base * (1 + gap), "高点较早情景\n" + f_date(topEarly), topColor, topBelow, line.style_dashed, true)
+            slot := f_mark(slot, topLate, base * (1 + gap * 3), "高点较晚情景\n" + f_date(topLate), topColor, topBelow, line.style_dashed, true)
+        slot := f_mark(slot, lowMid, base * (1 + gap * 2), "低点参考（时间假设）\n" + f_date(lowMid), bottomColor, bottomBelow, line.style_dashed, true)
+        slot := f_mark(slot, topMid, base * (1 + gap * 2), "高点参考（时间假设）\n" + f_date(topMid), topColor, topBelow, line.style_dashed, true)
+    if showNextHalving
+        slot := f_mark(slot, nextHalving, base * (1 + gap * 4), "第五次减半（手动估计）\n" + f_date(nextHalving), halvingColor, false, line.style_dashed, true)
+    if showRangeLow and not na(rangeLowPrice)
+        string lowText = rangeLowTitle + " " + f_date(rangeStart) + "\n价格：" + str.tostring(rangeLowPrice, format.mintick) + "\nK线日期：" + f_date(rangeLowTime)
+        if historyIncomplete
+            lowText += "\n注意：加载历史未覆盖起点"
+        slot := f_mark(slot, rangeLowTime, rangeLowPrice, lowText, bottomColor, bottomBelow, historyStyle, false)
+
+    // 回放或记录数量变化后，删除本轮多余的对象。
+    while array.size(labelPool) > slot
+        label.delete(array.pop(labelPool))
+        line.delete(array.pop(linePool))
+    table.clear(panel, 0, 0, 1, 8)
+    if showPanel
+        f_row(0, "BTC 周期地图", "UTC · 时间类比，非交易信号")
+        if showForecast
+            f_row(1, "假设顶部", f_date(anchor))
+            f_row(2, "低点类比窗口", f_span(lowEarly, lowLate))
+            // 独立锚点启用时，两段之间不强行拼接为一个确定周期。
+            f_row(3, "假设下跌阶段", f_span(anchor, lowMid))
+            f_row(4, useManualBottom ? "独立锚点上涨阶段" : "假设上涨阶段", f_span(riseMid, topMid))
+            f_row(5, "下一高点类比窗口", f_span(topEarly, topLate))
+        if showNextHalving
+            f_row(6, "减半手动估计", f_date(nextHalving))
+        if showRangeLow
+            string lowSummary = na(rangeLowPrice) ? "暂无符合条件的K线" : str.tostring(rangeLowPrice, format.mintick) + " / " + f_date(rangeLowTime)
+            f_row(7, "当前图表区间最低价", lowSummary)
+        string status = syminfo.basecurrency == "BTC" ? "请使用BTC美元标准日线" : "当前不是BTC图表"
+        if showRangeLow and historyIncomplete
+            status += "；最低价历史覆盖不足"
+        f_row(8, "数据提示", status)
+
+// ============================================================================
+// H. 背景：只表达时间假设。独立低点与参考低点之间若有空档，不进行填色。
+// 不对未来尚不存在的K线着色，也不在参考高点后继续臆测下一轮下跌。
+// ============================================================================
+color phaseColor = na
+if showForecast and showShade
+    int bearEnd = useManualBottom ? math.min(lowMid, manualBottom) : lowMid
+    if time >= anchor and time < bearEnd
+        phaseColor := color.new(topColor, shadeTransparency)
+    else if time >= riseMid and time < topMid
+        phaseColor := color.new(bottomColor, shadeTransparency)
+bgcolor(phaseColor, title = "假设下跌/上涨阶段")
